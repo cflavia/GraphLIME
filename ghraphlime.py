@@ -1,136 +1,152 @@
-import pandas as pd
-import tensorflow as tf
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from sklearn.datasets import load_diabetes
 from sklearn.model_selection import train_test_split
-from tensorflow.keras.layers import Dense
-from tensorflow.keras.models import Sequential
-from sklearn.utils import shuffle
-from sklearn.linear_model import LinearRegression
+from sklearn.preprocessing import StandardScaler
+from graphlime import GraphLIME
+from sklearn.neighbors import kneighbors_graph
+from torch_geometric.data import Data
+from torch_geometric.nn import GCNConv
+import pandas as pd
 import numpy as np
-from sklearn.metrics import mean_absolute_error, mean_squared_error, accuracy_score, classification_report, confusion_matrix
-import seaborn as sn
-from sklearn.metrics import roc_curve, auc
-import matplotlib.pyplot as plt
+from sklearn.metrics import r2_score
 
-file_path = 'diabetes.csv'
-df = pd.read_csv(file_path)
+data = pd.read_csv('data.csv')
+X = data.iloc[:, :-1].values
+y = data.iloc[:, -1].values
 
-X = df.iloc[:, :-1].values
-y = df.iloc[:, -1].values
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
 
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=0.2, random_state=42)
 
-model = Sequential([
-    Dense(64, activation='relu', input_shape=(X_train.shape[1],)),
-    Dense(32, activation='relu'),
-    Dense(1, activation='sigmoid')
-])
+k = 5
+adjacency_matrix = kneighbors_graph(X_train, n_neighbors=k, mode='connectivity', include_self=True)
+edge_index = torch.tensor(np.array(adjacency_matrix.nonzero()), dtype=torch.long)
 
-model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+x = torch.tensor(X_train, dtype=torch.float32)
+y = torch.tensor(y_train, dtype=torch.float32)
 
-model.fit(X_train, y_train, epochs=10, batch_size=32, validation_split=0.2)
+data_graph = Data(x=x, edge_index=edge_index, y=y)
 
-def generate_perturbed_samples(data, num_samples=100, noise_level=0.01):
-    perturbed_samples = []
-    for index, row in data.iterrows():
-        for _ in range(num_samples):
-            noise = np.random.normal(0, noise_level, size=row.shape)
-            new_sample = row + noise
-            perturbed_samples.append(new_sample)
+class GCN(nn.Module):
+    def __init__(self, in_channels, hidden_channels, out_channels):
+        super(GCN, self).__init__()
+        self.conv1 = GCNConv(in_channels, hidden_channels)
+        self.conv2 = GCNConv(hidden_channels, out_channels)
 
-    return pd.DataFrame(perturbed_samples)
+    def forward(self, x, edge_index):
+        x = self.conv1(x, edge_index).relu()
+        x = self.conv2(x, edge_index)
+        return x
 
-df_features_only = df.iloc[:, :-1]
-df_perturbed = generate_perturbed_samples(df_features_only)
+input_dim = X_train.shape[1]
+hidden_dim = 32
+output_dim = X_train.shape[1]
 
-def graphlime_explanation(instance, perturbed_data, model, local_model=LinearRegression()):
-    predictions = model.predict(perturbed_data)
-    local_model.fit(perturbed_data, predictions)
-    return local_model.coef_
+model = GCN(in_channels=input_dim, hidden_channels=hidden_dim, out_channels=output_dim)
+optimizer = optim.Adam(model.parameters(), lr=0.01)
+criterion = nn.MSELoss()
 
-for index, instance in df_features_only.iterrows():
-  instance = df_features_only.iloc[index]
-  perturbed_samples = generate_perturbed_samples(pd.DataFrame([instance]))
+epochs = 100
+for epoch in range(epochs):
+    model.train()
+    optimizer.zero_grad()
+    out = model(data_graph.x, data_graph.edge_index).squeeze()
+    loss = criterion(out, data_graph.x)
+    loss.backward()
+    optimizer.step()
 
-  explanation = graphlime_explanation(instance, perturbed_samples, model)
-  print(f"Explication for instance {index}: {explanation}")
+class CustomGraphLIME(GraphLIME):
+    def __init__(self, model, hop=2, rho=0.1):
+        super().__init__(model, hop, rho)
 
-def plot_graphlime_explanation(coeficients, feature_names):
-    coeficients = np.array(coeficients).flatten()
-    if len(coeficients) != len(feature_names):
-        raise ValueError("The len of coeficients is not equal with len of feature names")
+    def explain_node(self, node_idx, x, edge_index, **kwargs):
+        from sklearn.linear_model import LassoLars
 
-    plt.figure(figsize=(10, 6))
-    plt.bar(feature_names, coeficients, color='blue')
-    plt.xlabel('Features')
-    plt.ylabel('Importance of features')
-    plt.title('GraphLIME - Importance of features')
-    plt.xticks(rotation=45)
-    plt.show()
+        n, d = x.size()
+        dist = (x.unsqueeze(0) - x.unsqueeze(1)).pow(2).sum(dim=-1).sqrt()
+        K = torch.exp(-dist / (2 * self.rho ** 2))
 
-feature_names = df.columns[:-1]
-coeficients = explanation
-plot_graphlime_explanation(coeficients, feature_names)
+        K_bar = K[node_idx].detach().numpy()[:d].reshape(-1, 1)
+        L_bar = x[node_idx].detach().numpy()
 
-coeficients = np.array(coeficients).flatten()
-significant_features = [feature_names[i] for i, coef in enumerate(coeficients) if coef > 0]
-print(significant_features)
+        if K_bar.shape[0] != len(L_bar):
+            K_bar = K_bar[:len(L_bar)]
 
-df_filtered = df[significant_features]
+        solver = LassoLars(alpha=self.rho, fit_intercept=False, positive=True)
+        solver.fit(K_bar, L_bar)
+        coefs = solver.coef_
 
-df_filtered
-X_new = df_filtered.copy()
+        if len(coefs) < d:
+            coefs = np.pad(coefs, (0, d - len(coefs)), 'constant')
 
-df_filtered_with_outcome = df_filtered.copy()
-df_filtered_with_outcome['Outcome'] = df['Outcome']
+        return torch.tensor(coefs, dtype=torch.float32)
 
-df_filtered_with_outcome
+explainer = CustomGraphLIME(model=model, hop=2, rho=0.1)
 
-df_new = df_filtered_with_outcome
-y = df_new['Outcome']
-X_train_nou, X_test_nou, y_train_nou, y_test_nou = train_test_split(X_new, y, test_size=0.2, random_state=0)
-model = tf.keras.Sequential([
-        tf.keras.layers.Dense(64, activation="relu", input_shape=([df_new.shape[1] - 1])),
-        tf.keras.layers.Dense(32, activation="relu"),
-        tf.keras.layers.Dense(1, activation="sigmoid"),
-])
+node_idx = 0
+coefs = explainer.explain_node(node_idx, data_graph.x, data_graph.edge_index)
 
-model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
+contributions_df = pd.DataFrame({
+    'Feature': data.columns[:-1],
+    'Contribution': coefs.detach().numpy()
+})
 
-X_train_nou = np.asarray(X_train_nou).astype(np.float32)
-y_train_nou = np.asarray(y_train_nou).astype(np.float32)
+contributions_df = contributions_df.sort_values(by='Contribution', ascending=False)
 
-X_test_nou = np.asarray(X_test_nou).astype(np.float32)
-y_test_nou = np.asarray(y_test_nou).astype(np.float32)
+relevant_features = contributions_df[contributions_df['Contribution'] >= 0]['Feature'].tolist()
 
-model.fit(X_train_nou, y_train_nou, epochs=10, batch_size=60, validation_data=(X_test_nou, y_test_nou))
+relevant_feature_indices = [list(data.columns[:-1]).index(f) for f in relevant_features]
 
-y_pred_nou = model.predict(X_test_nou)
-y_pred_nou = y_pred_nou > 0.45
+X_train_relevant = X_train[:, relevant_feature_indices]
+X_test_relevant = X_test[:, relevant_feature_indices]
 
-np.set_printoptions()
-cm = confusion_matrix(y_test_nou, y_pred_nou)
-ac = accuracy_score(y_test_nou, y_pred_nou)
+X_train_relevant_tensor = torch.tensor(X_train_relevant, dtype=torch.float32)
+X_test_relevant_tensor = torch.tensor(X_test_relevant, dtype=torch.float32)
 
-cm
-labels = [0, 1]
-df_cm = pd.DataFrame(cm, labels, labels)
-ax = sn.heatmap(df_cm, annot=True, annot_kws={"size": 16}, square=True, cbar=False, fmt='g')
-ax.set_ylim(0, 2)
-plt.xlabel("Predicted")
-plt.ylabel("Actual")
-ax.invert_yaxis()
-plt.show()
+y_train_tensor = torch.tensor(y_train, dtype=torch.float32)
+y_test_tensor = torch.tensor(y_test, dtype=torch.float32)
 
-fpr_nou, tpr_nou, _ = roc_curve(y_test_nou, y_pred_nou)
-roc_auc_nou = auc(fpr_nou, tpr_nou)
+class AttentionMechanism(nn.Module):
+    def __init__(self, input_dim, hidden_dim):
+        super(ComplexAttentionMechanism, self).__init__()
+        self.attention_network = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, input_dim),
+            nn.Softmax(dim=-1)
+        )
 
-plt.figure(figsize=(10, 6))
-plt.plot(fpr_nou, tpr_nou, color='blue', lw=2, label='ROC curve (area = %0.2f)' % roc_auc_nou)
-plt.plot([0, 1], [0, 1], color='gray', lw=2, linestyle='--')
-plt.xlim([0.0, 1.0])
-plt.ylim([0.0, 1.05])
-plt.xlabel('False Positive Rate')
-plt.ylabel('True Positive Rate')
-plt.title('ROC Curve for our model')
-plt.legend(loc="lower right")
-plt.show()
+    def forward(self, x):
+        attention_scores = self.attention_network(x)
+        return x * attention_scores
+
+hidden_dim = 16
+attention_layer = AttentionMechanism(len(relevant_features), hidden_dim)
+
+attention_output_train = attention_layer(X_train_relevant_tensor)
+attention_output_test = attention_layer(X_test_relevant_tensor)
+
+linear_model = nn.Linear(len(relevant_features), 1)
+optimizer = optim.Adam(list(linear_model.parameters()) + list(attention_layer.parameters()), lr=0.01)
+criterion = nn.MSELoss()
+
+epochs = 100
+for epoch in range(epochs):
+    linear_model.train()
+    attention_layer.train()
+    optimizer.zero_grad()
+
+    attention_output_train = attention_layer(X_train_relevant_tensor)
+
+    predictions_train = linear_model(attention_output_train).squeeze()
+    loss = criterion(predictions_train, y_train_tensor)
+
+    loss.backward(retain_graph=True)
+    optimizer.step()
+
+linear_model.eval()
+with torch.no_grad():
+    predictions_test = linear_model(attention_output_test).squeeze().detach().numpy()
