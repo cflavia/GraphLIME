@@ -1,152 +1,180 @@
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from sklearn.datasets import load_diabetes
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
-from graphlime import GraphLIME
-from sklearn.neighbors import kneighbors_graph
-from torch_geometric.data import Data
-from torch_geometric.nn import GCNConv
 import pandas as pd
 import numpy as np
-from sklearn.metrics import r2_score
+import torch
+from sklearn.preprocessing import StandardScaler
+from sklearn.neighbors import NearestNeighbors
+from torch_geometric.data import Data
+import torch.nn.functional as F
+from torch_geometric.nn import GCNConv
+from sklearn.model_selection import train_test_split
+import torch.optim as optim
+import torch.nn as nn
+from graphlime import GraphLIME
 
-data = pd.read_csv('data.csv')
-X = data.iloc[:, :-1].values
-y = data.iloc[:, -1].values
+df = pd.read_csv(r"diabetes.csv")
+df = df.fillna(df.mean())
+X = df.drop(columns=['Outcome'])
+y = df['Outcome']
 
 scaler = StandardScaler()
 X_scaled = scaler.fit_transform(X)
 
-X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=0.2, random_state=42)
+node_features = torch.tensor(X_scaled, dtype=torch.float)
 
-k = 5
-adjacency_matrix = kneighbors_graph(X_train, n_neighbors=k, mode='connectivity', include_self=True)
-edge_index = torch.tensor(np.array(adjacency_matrix.nonzero()), dtype=torch.long)
+n_neighbors = 5
+knn = NearestNeighbors(n_neighbors=n_neighbors, metric='euclidean')
+knn.fit(X_scaled)
+distances, indices = knn.kneighbors(X_scaled)
 
-x = torch.tensor(X_train, dtype=torch.float32)
-y = torch.tensor(y_train, dtype=torch.float32)
+edge_index = []
+for i, neighbors in enumerate(indices):
+    for neighbor in neighbors:
+        if i != neighbor:
+            edge_index.append([i, neighbor])
 
-data_graph = Data(x=x, edge_index=edge_index, y=y)
+edge_index = torch.tensor(edge_index, dtype=torch.long).t().contiguous()
 
-class GCN(nn.Module):
-    def __init__(self, in_channels, hidden_channels, out_channels):
-        super(GCN, self).__init__()
-        self.conv1 = GCNConv(in_channels, hidden_channels)
-        self.conv2 = GCNConv(hidden_channels, out_channels)
+graph_data = Data(x=node_features, edge_index=edge_index)
+
+class GCNModel(torch.nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim):
+        super(GCNModel, self).__init__()
+        self.conv1 = GCNConv(input_dim, hidden_dim)
+        self.conv2 = GCNConv(hidden_dim, hidden_dim)
+        self.conv3 = GCNConv(hidden_dim, output_dim)
 
     def forward(self, x, edge_index):
-        x = self.conv1(x, edge_index).relu()
-        x = self.conv2(x, edge_index)
-        return x
+        x = F.relu(self.conv1(x, edge_index))
+        x = F.relu(self.conv2(x, edge_index))
+        x = F.dropout(x, p=0.5, training=self.training)
+        x = self.conv3(x, edge_index)
+        return F.log_softmax(x, dim=1)
 
-input_dim = X_train.shape[1]
-hidden_dim = 32
-output_dim = X_train.shape[1]
+input_dim = graph_data.x.shape[1]
+hidden_dim = 16
+output_dim = 2
 
-model = GCN(in_channels=input_dim, hidden_channels=hidden_dim, out_channels=output_dim)
-optimizer = optim.Adam(model.parameters(), lr=0.01)
-criterion = nn.MSELoss()
+model = GCNModel(input_dim, hidden_dim, output_dim)
 
-epochs = 100
-for epoch in range(epochs):
+class SimpleGCNModel(torch.nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim):
+        super(SimpleGCNModel, self).__init__()
+        self.conv1 = GCNConv(input_dim, hidden_dim)
+        self.fc = torch.nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, x, edge_index):
+        x = F.relu(self.conv1(x, edge_index))
+        x = F.dropout(x, p=0.5, training=self.training)
+        x = self.fc(x)
+        return F.log_softmax(x, dim=1)
+
+model = SimpleGCNModel(input_dim, hidden_dim, output_dim)
+
+train_mask, test_mask = train_test_split(np.arange(len(y)), test_size=0.2, random_state=42)
+
+labels = torch.tensor(y.values, dtype=torch.long)
+
+train_mask = torch.tensor(train_mask, dtype=torch.long)
+test_mask = torch.tensor(test_mask, dtype=torch.long)
+
+graph_data.y = labels
+graph_data.train_mask = train_mask
+graph_data.test_mask = test_mask
+
+optimizer = optim.Adam(model.parameters(), lr=0.01, weight_decay=5e-4)
+
+def train(model, graph_data, optimizer):
     model.train()
     optimizer.zero_grad()
-    out = model(data_graph.x, data_graph.edge_index).squeeze()
-    loss = criterion(out, data_graph.x)
+    out = model(graph_data.x, graph_data.edge_index)
+    loss = F.nll_loss(out[graph_data.train_mask], graph_data.y[graph_data.train_mask])
+    loss.backward()
+    optimizer.step()
+    return loss.item()
+
+def evaluate(model, graph_data):
+    model.eval()
+    out = model(graph_data.x, graph_data.edge_index)
+    pred = out.argmax(dim=1)
+    correct = (pred[graph_data.test_mask] == graph_data.y[graph_data.test_mask]).sum().item()
+    accuracy = correct / graph_data.test_mask.sum().item()
+    return accuracy
+
+num_epochs = 100
+for epoch in range(num_epochs):
+    loss = train(model, graph_data, optimizer)
+
+explainer = GraphLIME(model, hop=2, rho=0.1)
+
+node_idx = 0
+coefs = explainer.explain_node(node_idx, graph_data.x, graph_data.edge_index)
+mean_coefs = coefs.mean()
+
+all_coefs = []
+for node_idx in range(graph_data.x.shape[0]):
+    coefs = explainer.explain_node(node_idx, graph_data.x, graph_data.edge_index)
+    coefs_tensor = torch.tensor(coefs, dtype=torch.float32)
+    all_coefs.append(coefs_tensor)
+
+all_coefs = torch.stack(all_coefs)
+mean_coefs_per_feature = all_coefs.mean(dim=0)
+
+mean_coefs_dict = {feature_name: mean_coef.item() for feature_name, mean_coef in zip(feature_names, mean_coefs_per_feature)}
+
+threshold  = 0.1
+
+filtered_mean_coefs_dict = {feature: coef for feature, coef in mean_coefs_dict.items() if coef > threshold}
+
+selected_features = list(filtered_mean_coefs_dict.keys())
+
+df = pd.read_csv(r"data.csv")
+
+X = df[selected_features].values
+y = df['Outcome'].values
+
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+scaler = StandardScaler()
+X_train = scaler.fit_transform(X_train)
+X_test = scaler.transform(X_test)
+
+X_train_tensor = torch.tensor(X_train, dtype=torch.float32)
+X_test_tensor = torch.tensor(X_test, dtype=torch.float32)
+y_train_tensor = torch.tensor(y_train, dtype=torch.long)
+y_test_tensor = torch.tensor(y_test, dtype=torch.long)
+
+
+class AttentionModel(nn.Module):
+    def __init__(self, input_dim, attention_dim, hidden_dim, output_dim):
+        super(AttentionModel, self).__init__()
+        self.attention_weights = nn.Parameter(torch.randn(input_dim, attention_dim))
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, x):
+        attention_scores = torch.matmul(x, self.attention_weights)
+        attention_scores = torch.softmax(attention_scores, dim=1)
+        attended_features = x * attention_scores
+        x = torch.relu(self.fc1(attended_features))
+        x = self.fc2(x)
+        return x
+
+model = AttentionModel(input_dim=len(selected_features), attention_dim=1, hidden_dim=64, output_dim=2)
+
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=0.001)
+
+num_epochs = 100
+for epoch in range(num_epochs):
+    model.train()
+    outputs = model(X_train_tensor)
+    loss = criterion(outputs, y_train_tensor)
+    optimizer.zero_grad()
     loss.backward()
     optimizer.step()
 
-class CustomGraphLIME(GraphLIME):
-    def __init__(self, model, hop=2, rho=0.1):
-        super().__init__(model, hop, rho)
-
-    def explain_node(self, node_idx, x, edge_index, **kwargs):
-        from sklearn.linear_model import LassoLars
-
-        n, d = x.size()
-        dist = (x.unsqueeze(0) - x.unsqueeze(1)).pow(2).sum(dim=-1).sqrt()
-        K = torch.exp(-dist / (2 * self.rho ** 2))
-
-        K_bar = K[node_idx].detach().numpy()[:d].reshape(-1, 1)
-        L_bar = x[node_idx].detach().numpy()
-
-        if K_bar.shape[0] != len(L_bar):
-            K_bar = K_bar[:len(L_bar)]
-
-        solver = LassoLars(alpha=self.rho, fit_intercept=False, positive=True)
-        solver.fit(K_bar, L_bar)
-        coefs = solver.coef_
-
-        if len(coefs) < d:
-            coefs = np.pad(coefs, (0, d - len(coefs)), 'constant')
-
-        return torch.tensor(coefs, dtype=torch.float32)
-
-explainer = CustomGraphLIME(model=model, hop=2, rho=0.1)
-
-node_idx = 0
-coefs = explainer.explain_node(node_idx, data_graph.x, data_graph.edge_index)
-
-contributions_df = pd.DataFrame({
-    'Feature': data.columns[:-1],
-    'Contribution': coefs.detach().numpy()
-})
-
-contributions_df = contributions_df.sort_values(by='Contribution', ascending=False)
-
-relevant_features = contributions_df[contributions_df['Contribution'] >= 0]['Feature'].tolist()
-
-relevant_feature_indices = [list(data.columns[:-1]).index(f) for f in relevant_features]
-
-X_train_relevant = X_train[:, relevant_feature_indices]
-X_test_relevant = X_test[:, relevant_feature_indices]
-
-X_train_relevant_tensor = torch.tensor(X_train_relevant, dtype=torch.float32)
-X_test_relevant_tensor = torch.tensor(X_test_relevant, dtype=torch.float32)
-
-y_train_tensor = torch.tensor(y_train, dtype=torch.float32)
-y_test_tensor = torch.tensor(y_test, dtype=torch.float32)
-
-class AttentionMechanism(nn.Module):
-    def __init__(self, input_dim, hidden_dim):
-        super(ComplexAttentionMechanism, self).__init__()
-        self.attention_network = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, input_dim),
-            nn.Softmax(dim=-1)
-        )
-
-    def forward(self, x):
-        attention_scores = self.attention_network(x)
-        return x * attention_scores
-
-hidden_dim = 16
-attention_layer = AttentionMechanism(len(relevant_features), hidden_dim)
-
-attention_output_train = attention_layer(X_train_relevant_tensor)
-attention_output_test = attention_layer(X_test_relevant_tensor)
-
-linear_model = nn.Linear(len(relevant_features), 1)
-optimizer = optim.Adam(list(linear_model.parameters()) + list(attention_layer.parameters()), lr=0.01)
-criterion = nn.MSELoss()
-
-epochs = 100
-for epoch in range(epochs):
-    linear_model.train()
-    attention_layer.train()
-    optimizer.zero_grad()
-
-    attention_output_train = attention_layer(X_train_relevant_tensor)
-
-    predictions_train = linear_model(attention_output_train).squeeze()
-    loss = criterion(predictions_train, y_train_tensor)
-
-    loss.backward(retain_graph=True)
-    optimizer.step()
-
-linear_model.eval()
+model.eval()
 with torch.no_grad():
-    predictions_test = linear_model(attention_output_test).squeeze().detach().numpy()
+    outputs = model(X_test_tensor)
+    _, predicted = torch.max(outputs, 1)
+    accuracy = (predicted == y_test_tensor).sum().item() / len(y_test_tensor)
